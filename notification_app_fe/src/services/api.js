@@ -3,87 +3,64 @@ import Log from "./logger";
 
 /**
  * API Service
- * Handles all HTTP communication with the backend notification API.
- * No authentication headers needed - users are pre-authorized.
+ * Handles authentication and notification fetching from the evaluation service.
  */
 
-const API_BASE =
-  process.env.REACT_APP_API_BASE || "http://localhost:5000/api/v1/notifications";
+const AUTH_URL = "http://4.224.186.213/evaluation-service/auth";
+const NOTIFICATIONS_URL = "http://4.224.186.213/evaluation-service/notifications";
 
-const api = axios.create({
-  baseURL: API_BASE,
-  headers: {
-    "Content-Type": "application/json",
-  },
-});
+const AUTH_BODY = {
+  email: process.env.REACT_APP_LOG_EMAIL || "",
+  name: process.env.REACT_APP_LOG_NAME || "",
+  rollNo: process.env.REACT_APP_LOG_ROLL_NO || "",
+  accessCode: process.env.REACT_APP_LOG_ACCESS_CODE || "",
+  clientID: process.env.REACT_APP_LOG_CLIENT_ID || "",
+  clientSecret: process.env.REACT_APP_LOG_CLIENT_SECRET || "",
+};
 
-// Request interceptor - logs all outgoing API calls
-api.interceptors.request.use(
-  (config) => {
-    Log(
-      "frontend",
-      "debug",
-      "api",
-      `Request: ${config.method.toUpperCase()} ${config.url}`
-    );
-    return config;
-  },
-  (error) => {
-    Log("frontend", "error", "api", `Request setup error: ${error.message}`);
-    return Promise.reject(error);
+let cachedToken = null;
+let tokenExpiry = 0;
+
+/** Get auth token with caching */
+async function getToken() {
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiry) return cachedToken;
+
+  try {
+    const res = await axios.post(AUTH_URL, AUTH_BODY);
+    cachedToken = res.data.access_token;
+    tokenExpiry = now + 12 * 60 * 1000;
+    Log("frontend", "info", "auth", "Auth token refreshed");
+    return cachedToken;
+  } catch (err) {
+    Log("frontend", "error", "auth", `Token fetch failed: ${err.message}`);
+    return null;
   }
-);
+}
 
-// Response interceptor - logs all API responses
-api.interceptors.response.use(
-  (response) => {
-    Log(
-      "frontend",
-      "debug",
-      "api",
-      `Response: ${response.status} from ${response.config.url}`
-    );
-    return response;
-  },
-  (error) => {
-    Log(
-      "frontend",
-      "error",
-      "api",
-      `Response error: ${error.response?.status || "network"} - ${error.message}`
-    );
-    return Promise.reject(error);
+/** Fetch notifications with optional query params */
+export async function fetchNotifications(params = {}) {
+  const token = await getToken();
+  if (!token) return [];
+
+  try {
+    const queryParts = [];
+    if (params.type) queryParts.push(`notification_type=${params.type}`);
+    if (params.limit) queryParts.push(`limit=${params.limit}`);
+    if (params.page) queryParts.push(`page=${params.page}`);
+
+    const queryStr = queryParts.length > 0 ? `?${queryParts.join("&")}` : "";
+    const url = `${NOTIFICATIONS_URL}${queryStr}`;
+
+    Log("frontend", "info", "api", `Fetching: ${url}`);
+    const res = await axios.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    Log("frontend", "info", "api", `Received ${res.data.notifications.length} notifications`);
+    return res.data.notifications || [];
+  } catch (err) {
+    Log("frontend", "error", "api", `Fetch failed: ${err.message}`);
+    return [];
   }
-);
-
-/** Fetch all notifications with pagination */
-export const getNotifications = (page = 1, limit = 20) => {
-  return api.get(`/?page=${page}&limit=${limit}`);
-};
-
-/** Fetch a single notification by ID */
-export const getNotificationById = (id) => {
-  return api.get(`/${id}`);
-};
-
-/** Get unread notification count */
-export const getUnreadCount = () => {
-  return api.get("/unread-count");
-};
-
-/** Mark a single notification as read */
-export const markAsRead = (id) => {
-  return api.patch(`/${id}/read`);
-};
-
-/** Mark all notifications as read */
-export const markAllAsRead = () => {
-  return api.patch("/read-all");
-};
-
-/** Delete a notification */
-export const deleteNotification = (id) => {
-  return api.delete(`/${id}`);
-};
-
-export default api;
+}
