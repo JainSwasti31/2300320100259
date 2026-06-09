@@ -1541,3 +1541,166 @@ With the redesigned system:
 4. **Exponential backoff** — if the email API is rate-limiting us, hammering it immediately makes things worse. Waiting 5s, then 10s, then 20s gives it breathing room
 
 5. **Dead letter queue** — permanently failed jobs don't disappear. They sit in a known place where someone can investigate and manually intervene
+
+---
+
+# Stage 6
+
+## Priority Inbox — Top N Notifications by Importance
+
+---
+
+## 1. The Problem
+
+The product manager wants a "Priority Inbox" that always shows the top N most important unread notifications. Priority is determined by:
+- **Type weight**: Placement > Result > Event
+- **Recency**: newer notifications rank higher than older ones
+
+New notifications keep flowing in, so we need an efficient way to maintain the top N without re-sorting everything each time.
+
+---
+
+## 2. My Approach
+
+### Scoring Formula
+
+Each notification gets a priority score computed as:
+
+```
+score = type_weight × recency_factor
+```
+
+Where:
+- `type_weight`: Placement = 3, Result = 2, Event = 1
+- `recency_factor`: `1 / (1 + hours_since_creation × 0.1)`
+
+The recency factor is a decay function. A notification from 1 hour ago gets a recency of ~0.91, while one from 24 hours ago gets ~0.29. This ensures recent notifications of the same type rank higher, but a Placement from yesterday can still outrank an Event from an hour ago (because 3 × 0.29 = 0.87 > 1 × 0.91).
+
+### Why this formula works
+
+| Scenario | Score |
+|----------|-------|
+| Placement, 1 hour ago | 3 × 0.91 = 2.73 |
+| Result, 1 hour ago | 2 × 0.91 = 1.82 |
+| Event, 1 hour ago | 1 × 0.91 = 0.91 |
+| Placement, 24 hours ago | 3 × 0.29 = 0.87 |
+| Result, 24 hours ago | 2 × 0.29 = 0.58 |
+
+A fresh Placement absolutely dominates. A day-old Placement is roughly equivalent to a fresh Event — which feels right intuitively.
+
+---
+
+## 3. Maintaining Top N Efficiently (Min-Heap)
+
+When new notifications continuously arrive, re-sorting the entire list to find top 10 is wasteful. Instead, I use a **min-heap of size N**:
+
+### How it works:
+
+1. Create a min-heap that holds at most N items (sorted by score, minimum at the top)
+2. For each notification:
+   - If the heap has fewer than N items → just insert it
+   - If the new notification's score is higher than the heap's minimum → pop the min, insert the new one
+   - If the new score is lower → discard it, it won't make the top N
+3. At the end, the heap contains exactly the top N highest-scoring notifications
+
+### Complexity:
+
+| Operation | Cost |
+|-----------|------|
+| Insert into heap | O(log N) |
+| Process all notifications | O(M × log N) where M = total notifications |
+| Get sorted output | O(N log N) |
+
+For N=10 and M=10,000 notifications, that's about 10,000 × 3.3 = 33,000 comparisons. A full sort would be 10,000 × 13.3 = 133,000 comparisons. The heap approach is ~4x faster and uses constant O(N) memory.
+
+### For streaming/real-time:
+
+When a new notification comes in via WebSocket, we don't reprocess everything. We just:
+1. Compute its score
+2. Check if it beats the heap's current minimum
+3. If yes, swap it in — O(log N) = O(log 10) = ~3 operations
+
+This is what makes the solution efficient for continuously arriving notifications.
+
+---
+
+## 4. Implementation
+
+The working code is in `notification_app_be/priority-inbox.js`. Key points:
+
+- **No external algorithm libraries** — the min-heap is implemented from scratch
+- **Fetches data from the evaluation service API** (http://4.224.186.213/evaluation-service/notifications)
+- **Auth token is obtained programmatically** before fetching
+- **Logging middleware is used** throughout (no console.log)
+- Outputs the ranked top 10 notifications with their scores
+
+### Running it:
+
+```bash
+cd notification_app_be
+node priority-inbox.js
+```
+
+---
+
+## 5. Sample Output
+
+```
+======================================================================
+  PRIORITY INBOX - Top 10 Notifications
+  Scoring: Type Weight (Placement=3, Result=2, Event=1) x Recency
+======================================================================
+
+  #1  [Placement]  Marriott International Inc. hiring    Score: 1.8070
+  #2  [Placement]  TSMC hiring                           Score: 1.5709
+  #3  [Result   ]  external                              Score: 1.1743
+  #4  [Result   ]  project-review                        Score: 1.1083
+  #5  [Result   ]  mid-sem                               Score: 0.9992
+  #6  [Result   ]  mid-sem                               Score: 0.9966
+  #7  [Placement]  Marriott International Inc. hiring    Score: 0.9369
+  #8  [Placement]  CSX Corporation hiring                Score: 0.7782
+  #9  [Result   ]  project-review                        Score: 0.6046
+  #10 [Result   ]  internal                              Score: 0.5965
+
+======================================================================
+  Priority weights: Placement(3) > Result(2) > Event(1)
+  Recency decay: score = weight * (1 / (1 + hours_ago * 0.1))
+  Min-Heap approach: O(log N) per new notification for top-N maintenance
+======================================================================
+```
+
+Notice how Placements dominate the top positions due to their higher weight (3x), and within the same type, more recent ones rank higher. Events don't appear because their weight (1) can't compete with recent Placements and Results.
+
+---
+
+## 6. How to Maintain Top 10 as New Notifications Arrive
+
+Three practical approaches depending on the context:
+
+### Approach A: Min-Heap in memory (what I implemented)
+
+Keep a min-heap of size 10 in the server's memory. Every time a new notification arrives (via the POST endpoint or WebSocket), compute its score and try inserting into the heap. The heap automatically ejects the lowest-scoring item if the new one is better.
+
+**Good for**: Single server, moderate traffic
+**Cost per new notification**: O(log 10) ≈ O(1) effectively
+
+### Approach B: Redis Sorted Set (for distributed/scalable setups)
+
+Store the top N in a Redis sorted set with score as the rank value. When a new notification arrives:
+
+```
+ZADD priority_inbox <score> <notification_id>
+ZREMRANGEBYRANK priority_inbox 0 -(N+1)  // trim to keep only top N
+```
+
+**Good for**: Multiple server instances, shared state needed
+**Cost**: O(log N) for ZADD, O(1) for the trim
+
+### Approach C: Periodic recalculation (if recency matters a lot)
+
+Since recency decays over time, a notification's score changes even without new data. Run a scheduled job every 5 minutes to recalculate all scores and update the top N.
+
+**Good for**: When the ranking must always reflect "right now" recency
+**Tradeoff**: Slightly stale data between recalculations (5 min max)
+
+For our campus use case, Approach A combined with periodic refresh (every few minutes) is the best balance of simplicity and correctness.
