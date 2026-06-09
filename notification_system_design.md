@@ -857,3 +857,193 @@ db.notifications.aggregate([
 | 90+ days | Auto-deleted via TTL index |
 
 The TTL index on `createdAt` automatically removes documents older than 90 days, keeping the collection size manageable without manual intervention.
+
+---
+
+# Stage 3
+
+## Query Analysis, Optimization & Indexing Strategy
+
+---
+
+## 1. Analyzing the Given Query
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+### Is this query accurate?
+
+Yes and no. Functionally, it does what it intends to do — it pulls all unread notifications for student 1042 sorted by time. But there are a few issues that make it less than ideal for a table with 5 million rows:
+
+1. **`SELECT *` pulls every column** — this forces the DB engine to read the entire row from disk even if the frontend only needs `title`, `message`, and `createdAt`. On a wide table with metadata/BLOB columns, this wastes I/O bandwidth significantly.
+
+2. **`ORDER BY createdAt ASC`** — sorting 5M rows (or even the subset matching the WHERE clause) requires either an index that already stores data in that order, or an expensive filesort operation in memory/disk. Without a proper index, MySQL will create a temporary table to sort.
+
+3. **No LIMIT clause** — if a student has 500 unread notifications, the query dumps all of them in one shot. In practice you'd want pagination.
+
+4. **Boolean handling** — `isRead = false` works but depending on the DB engine and how the column was defined (BOOLEAN vs TINYINT), the optimizer might handle it differently. Not a major issue, just something to be aware of.
+
+---
+
+## 2. Why is this query slow?
+
+With 5,000,000 notifications and 50,000 students, here's what's happening under the hood:
+
+### Without proper indexes:
+
+The DB performs a **full table scan** — it reads all 5M rows one by one, checks if `studentID = 1042` AND `isRead = false`, collects the matches, then sorts them by `createdAt`. 
+
+Let me break down the cost:
+
+| Operation | What happens | Cost |
+|-----------|-------------|------|
+| Full table scan | Engine reads every row from disk | O(n) where n = 5,000,000 |
+| Filter (WHERE) | Check two conditions per row | Still O(n) — every row is checked |
+| Sort (ORDER BY) | Sort matching rows by createdAt | O(k log k) where k = matched rows |
+| Return (`SELECT *`) | Fetch all columns for matched rows | Extra I/O for wide rows |
+
+Even if only 100 rows match for student 1042, the engine still touches all 5M rows to find them. That's the core problem.
+
+### Estimated computation cost:
+
+- **Disk I/O**: ~5M row reads × average row size. If each row is 500 bytes, that's ~2.5 GB of data scanned.
+- **CPU**: 5M comparisons for the WHERE clause
+- **Memory**: Temporary sort buffer for matched rows
+- **Time**: On a typical server, this could take 10-30 seconds depending on hardware and disk type.
+
+---
+
+## 3. What would I change?
+
+### Fix 1: Add a composite index
+
+```sql
+CREATE INDEX idx_student_unread_date 
+ON notifications (studentID, isRead, createdAt);
+```
+
+This one index solves all three problems:
+- Directly jumps to studentID = 1042 (no full scan)
+- Within that, narrows to isRead = false
+- Data is already sorted by createdAt, so no filesort needed
+
+### Fix 2: Don't use SELECT *
+
+```sql
+SELECT id, title, message, type, priority, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC
+LIMIT 20 OFFSET 0;
+```
+
+Only grab what the API actually returns. If the index covers these columns, we get a **covering index** (the engine doesn't even need to touch the main table).
+
+### Fix 3: Add pagination
+
+The LIMIT + OFFSET prevents returning massive result sets. For cursor-based pagination (better at scale):
+
+```sql
+SELECT id, title, message, type, priority, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false AND createdAt > '2026-06-01T00:00:00'
+ORDER BY createdAt ASC
+LIMIT 20;
+```
+
+### After optimization — new cost:
+
+| Operation | What happens | Cost |
+|-----------|-------------|------|
+| Index seek | B-tree traversal to studentID=1042, isRead=false | O(log n) |
+| Index scan | Read matching entries in order | O(k) where k = matched rows |
+| No sort needed | Index already in createdAt order | O(1) |
+| Limited output | Return max 20 rows | Constant |
+
+From 10-30 seconds down to **< 10 milliseconds**. That's the power of proper indexing.
+
+---
+
+## 4. Should you add indexes on every column?
+
+A colleague suggested "just add indexes on every column to be safe." Here's why that's bad advice:
+
+### Why indexing every column is NOT effective:
+
+| Problem | Explanation |
+|---------|-------------|
+| **Write performance degrades** | Every INSERT, UPDATE, or DELETE must now update every single index. With 10+ indexes on a table getting hundreds of writes per second, this becomes a serious bottleneck. |
+| **Disk space bloat** | Each index is essentially a copy of that column's data in a B-tree structure. 10 indexes on a 5M-row table could easily double or triple storage requirements. |
+| **Optimizer confusion** | When too many indexes exist, the query planner might pick a suboptimal index. It spends more time evaluating which index to use (query planning overhead). |
+| **Maintenance overhead** | Index fragmentation accumulates over time. More indexes = more OPTIMIZE TABLE operations needed. |
+| **Composite queries ignored** | Single-column indexes don't help multi-column WHERE clauses efficiently. The DB can only use one index per table access (in most cases), or it does an index merge which is slower than a proper composite index. |
+
+### What to do instead:
+
+- Look at your actual query patterns (the WHERE, ORDER BY, and JOIN clauses your app uses)
+- Create **composite indexes** that match those patterns
+- Follow the left-prefix rule: put the most selective column first
+- Use `EXPLAIN` to verify the optimizer uses your indexes
+- Monitor slow query logs to identify missing indexes over time
+
+**Rule of thumb**: 3-5 well-designed composite indexes beat 15 single-column indexes every time.
+
+---
+
+## 5. Query: Students who got a placement notification in the last 7 days
+
+The table has a `notificationType` column with enum values: "Event", "Result", "Placement".
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL 7 DAY;
+```
+
+### Why this works:
+
+- `notificationType = 'Placement'` filters to only placement-type entries
+- `createdAt >= NOW() - INTERVAL 7 DAY` limits to the last week
+- `DISTINCT studentID` ensures each student appears once even if they received multiple placement notifications
+
+### Supporting index:
+
+```sql
+CREATE INDEX idx_type_date_student 
+ON notifications (notificationType, createdAt, studentID);
+```
+
+This index:
+1. Jumps straight to `notificationType = 'Placement'` entries
+2. Within those, scans only rows from the last 7 days (range scan on createdAt)
+3. Has `studentID` in the index so DISTINCT can be resolved from the index alone (covering index)
+
+### Estimated cost with this index:
+
+Assuming ~1M placement notifications total, and ~50K from the last 7 days:
+- Index seek: O(log n) to find "Placement" + start date
+- Index range scan: reads ~50K index entries
+- No table access needed (covering index)
+- Execution time: **< 50ms**
+
+### Without the index:
+
+Full table scan of 5M rows, filter, then sort/distinct. Easily 15-20 seconds.
+
+---
+
+## 6. Summary of Recommendations
+
+| # | Action | Impact |
+|---|--------|--------|
+| 1 | Replace `SELECT *` with specific columns | Reduces I/O, enables covering indexes |
+| 2 | Add composite index `(studentID, isRead, createdAt)` | Eliminates full scan, removes filesort |
+| 3 | Add LIMIT for pagination | Prevents memory issues on large result sets |
+| 4 | Don't index every column blindly | Saves write performance and storage |
+| 5 | Create targeted composite indexes based on query patterns | Best performance-to-cost ratio |
+| 6 | Use EXPLAIN regularly | Catch slow queries before they hit production |
+| 7 | Consider partitioning by date for tables > 10M rows | Faster range queries and easier maintenance |
