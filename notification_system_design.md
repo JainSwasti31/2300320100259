@@ -477,3 +477,383 @@ All API endpoints require a valid JWT token passed in the `Authorization` header
 | Real-time | Socket.IO |
 | Database | MongoDB (with Mongoose ODM) |
 | Authentication | JWT (JSON Web Tokens) |
+
+---
+
+# Stage 2
+
+## Database Design, Schema & Queries
+
+---
+
+## 1. Database Choice: MongoDB (NoSQL)
+
+### Why MongoDB?
+
+| Criteria | Justification |
+|----------|---------------|
+| **Schema Flexibility** | Notifications can carry varying `metadata` depending on the type (placement link, event venue, result PDF URL). MongoDB's flexible document model handles this without ALTER TABLE operations. |
+| **High Write Throughput** | A campus platform generates notifications in bursts (e.g., result day, placement drive announcements). MongoDB handles high-velocity inserts efficiently with its write-optimized storage engine (WiredTiger). |
+| **Horizontal Scalability** | As the student population and notification volume grow, MongoDB supports sharding natively, distributing data across multiple nodes. |
+| **Natural JSON Mapping** | The API request/response bodies are JSON. MongoDB stores BSON (binary JSON), eliminating the impedance mismatch between the application layer and the database. |
+| **Time-Series Friendly** | Notifications are naturally time-ordered and mostly append-only, fitting MongoDB's document model well. |
+| **TTL Indexes** | MongoDB supports TTL (Time-To-Live) indexes that can automatically delete old notifications, reducing manual cleanup. |
+
+---
+
+## 2. Database Schema
+
+### Collection: `notifications`
+
+```javascript
+{
+  _id: ObjectId,                    // Auto-generated unique identifier
+  title: String,                    // Notification title (max 200 chars)
+  message: String,                  // Notification body (max 1000 chars)
+  type: String,                     // Enum: "placement" | "event" | "result"
+  status: String,                   // Enum: "read" | "unread" (default: "unread")
+  priority: String,                 // Enum: "low" | "medium" | "high" (default: "low")
+  metadata: Object,                 // Flexible additional data (links, venue, company name, etc.)
+  readAt: Date | null,              // Timestamp when notification was read
+  createdAt: Date,                  // Auto-generated creation timestamp
+  updatedAt: Date                   // Auto-generated update timestamp
+}
+```
+
+### Mongoose Schema Definition
+
+```javascript
+const mongoose = require("mongoose");
+
+const notificationSchema = new mongoose.Schema(
+  {
+    title: {
+      type: String,
+      required: true,
+      maxlength: 200,
+    },
+    message: {
+      type: String,
+      required: true,
+      maxlength: 1000,
+    },
+    type: {
+      type: String,
+      required: true,
+      enum: ["placement", "event", "result"],
+    },
+    status: {
+      type: String,
+      enum: ["read", "unread"],
+      default: "unread",
+    },
+    priority: {
+      type: String,
+      enum: ["low", "medium", "high"],
+      default: "low",
+    },
+    metadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    readAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  {
+    timestamps: true, // Adds createdAt and updatedAt automatically
+  }
+);
+
+module.exports = mongoose.model("Notification", notificationSchema);
+```
+
+---
+
+## 3. Indexes
+
+```javascript
+// Index for filtering by status (read/unread queries)
+notificationSchema.index({ status: 1 });
+
+// Index for filtering by type (placement/event/result)
+notificationSchema.index({ type: 1 });
+
+// Index for sorting by creation time (most recent first)
+notificationSchema.index({ createdAt: -1 });
+
+// Compound index for common query pattern: filter by status + sort by date
+notificationSchema.index({ status: 1, createdAt: -1 });
+
+// Compound index for type filtering + date sorting
+notificationSchema.index({ type: 1, createdAt: -1 });
+
+// TTL index to auto-delete notifications older than 90 days
+notificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7776000 });
+```
+
+---
+
+## 4. Problems with Increasing Data Volume & Solutions
+
+### Problem 1: Slow Queries on Large Collections
+
+**Issue:** As notifications grow to millions of documents, queries without proper indexes result in full collection scans.
+
+**Solution:**
+- Create compound indexes that match query patterns (status + createdAt, type + createdAt).
+- Use `explain()` to identify and optimize slow queries.
+- Use covered queries where possible (query uses only indexed fields).
+
+### Problem 2: Unbounded Collection Growth
+
+**Issue:** Notifications accumulate indefinitely, consuming disk space and degrading performance.
+
+**Solution:**
+- Implement TTL indexes to auto-expire old notifications (e.g., 90 days).
+- Use capped collections for a sliding window of recent notifications if archival is needed.
+- Implement archival: move old notifications to a separate `notifications_archive` collection.
+
+### Problem 3: Memory Pressure from Large Result Sets
+
+**Issue:** Fetching thousands of notifications in a single query causes memory spikes and slow responses.
+
+**Solution:**
+- Enforce pagination (limit/skip or cursor-based).
+- Use projection to return only required fields.
+- Implement cursor-based pagination using `_id` for consistent performance regardless of offset size.
+
+### Problem 4: Write Contention During Bulk Updates
+
+**Issue:** "Mark All as Read" updates potentially thousands of documents simultaneously, causing write locks.
+
+**Solution:**
+- Use `updateMany` with appropriate write concern.
+- For very large batches, implement chunked updates (process 500 documents at a time).
+- Consider eventual consistency for non-critical status updates.
+
+### Problem 5: Horizontal Scaling Needs
+
+**Issue:** A single MongoDB instance cannot handle the load of a growing campus.
+
+**Solution:**
+- Use MongoDB Replica Sets for read scaling (read from secondaries).
+- Implement sharding with `type` or `createdAt` as the shard key for even data distribution.
+- Use read preferences to distribute read load across replica members.
+
+---
+
+## 5. NoSQL Queries for Each REST API Endpoint
+
+### 5.1 GET `/api/v1/notifications` — Fetch All Notifications (Paginated)
+
+```javascript
+// Basic paginated query
+db.notifications.find({})
+  .sort({ createdAt: -1 })
+  .skip((page - 1) * limit)
+  .limit(limit);
+
+// With status filter
+db.notifications.find({ status: "unread" })
+  .sort({ createdAt: -1 })
+  .skip(0)
+  .limit(20);
+
+// With type filter
+db.notifications.find({ type: "placement" })
+  .sort({ createdAt: -1 })
+  .skip(0)
+  .limit(20);
+
+// Count for pagination metadata
+db.notifications.countDocuments({ status: "unread" });
+```
+
+### 5.2 GET `/api/v1/notifications/:id` — Fetch Single Notification
+
+```javascript
+db.notifications.findOne({ _id: ObjectId("664f1a2b3c4d5e6f7a8b9c0d") });
+```
+
+### 5.3 POST `/api/v1/notifications` — Create Notification
+
+```javascript
+db.notifications.insertOne({
+  title: "TCS Placement Drive - June 2026",
+  message: "TCS is conducting on-campus placement drive on 15th June. Eligible branches: CSE, IT, ECE. Register on the placement portal.",
+  type: "placement",
+  status: "unread",
+  priority: "high",
+  metadata: {
+    company: "TCS",
+    date: "2026-06-15",
+    eligibleBranches: ["CSE", "IT", "ECE"],
+    registrationLink: "/placement/tcs-june-2026"
+  },
+  readAt: null,
+  createdAt: new Date(),
+  updatedAt: new Date()
+});
+```
+
+### 5.4 PATCH `/api/v1/notifications/:id/read` — Mark as Read
+
+```javascript
+db.notifications.findOneAndUpdate(
+  { _id: ObjectId("664f1a2b3c4d5e6f7a8b9c0d") },
+  {
+    $set: {
+      status: "read",
+      readAt: new Date(),
+      updatedAt: new Date()
+    }
+  },
+  { returnDocument: "after" }
+);
+```
+
+### 5.5 PATCH `/api/v1/notifications/read-all` — Mark All as Read
+
+```javascript
+db.notifications.updateMany(
+  { status: "unread" },
+  {
+    $set: {
+      status: "read",
+      readAt: new Date(),
+      updatedAt: new Date()
+    }
+  }
+);
+```
+
+### 5.6 DELETE `/api/v1/notifications/:id` — Delete Notification
+
+```javascript
+db.notifications.findOneAndDelete({
+  _id: ObjectId("664f1a2b3c4d5e6f7a8b9c0d")
+});
+```
+
+### 5.7 GET `/api/v1/notifications/unread-count` — Get Unread Count
+
+```javascript
+db.notifications.countDocuments({ status: "unread" });
+```
+
+---
+
+## 6. Sample Documents
+
+### Placement Notification
+```json
+{
+  "_id": "664f1a2b3c4d5e6f7a8b9c01",
+  "title": "TCS Placement Drive - June 2026",
+  "message": "TCS is conducting on-campus placement drive on 15th June. Eligible branches: CSE, IT, ECE.",
+  "type": "placement",
+  "status": "unread",
+  "priority": "high",
+  "metadata": {
+    "company": "TCS",
+    "date": "2026-06-15",
+    "eligibleBranches": ["CSE", "IT", "ECE"],
+    "registrationLink": "/placement/tcs-june-2026"
+  },
+  "readAt": null,
+  "createdAt": "2026-06-09T09:00:00.000Z",
+  "updatedAt": "2026-06-09T09:00:00.000Z"
+}
+```
+
+### Event Notification
+```json
+{
+  "_id": "664f1a2b3c4d5e6f7a8b9c02",
+  "title": "Annual Tech Fest - Hackathon Registration Open",
+  "message": "Register for the 24-hour hackathon at the annual tech fest. Teams of 2-4 members. Prizes worth 50K.",
+  "type": "event",
+  "status": "unread",
+  "priority": "medium",
+  "metadata": {
+    "eventName": "Tech Fest 2026",
+    "venue": "Main Auditorium",
+    "date": "2026-06-20",
+    "registrationDeadline": "2026-06-18"
+  },
+  "readAt": null,
+  "createdAt": "2026-06-09T10:30:00.000Z",
+  "updatedAt": "2026-06-09T10:30:00.000Z"
+}
+```
+
+### Result Notification
+```json
+{
+  "_id": "664f1a2b3c4d5e6f7a8b9c03",
+  "title": "6th Semester Results Declared",
+  "message": "Results for 6th semester examinations have been published. Check the results portal.",
+  "type": "result",
+  "status": "read",
+  "priority": "high",
+  "metadata": {
+    "semester": 6,
+    "resultLink": "/results/sem6-2026",
+    "publishedBy": "Examination Cell"
+  },
+  "readAt": "2026-06-09T12:00:00.000Z",
+  "createdAt": "2026-06-09T11:00:00.000Z",
+  "updatedAt": "2026-06-09T12:00:00.000Z"
+}
+```
+
+---
+
+## 7. Aggregation Queries (Analytics)
+
+### Count notifications by type
+```javascript
+db.notifications.aggregate([
+  { $group: { _id: "$type", count: { $sum: 1 } } }
+]);
+```
+
+### Count unread by type
+```javascript
+db.notifications.aggregate([
+  { $match: { status: "unread" } },
+  { $group: { _id: "$type", unreadCount: { $sum: 1 } } }
+]);
+```
+
+### Notifications per day (last 7 days)
+```javascript
+db.notifications.aggregate([
+  {
+    $match: {
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }
+    }
+  },
+  {
+    $group: {
+      _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+      count: { $sum: 1 }
+    }
+  },
+  { $sort: { _id: -1 } }
+]);
+```
+
+---
+
+## 8. Data Retention Strategy
+
+| Age | Action |
+|-----|--------|
+| 0–30 days | Active — fully queryable |
+| 30–90 days | Warm — available but lower priority |
+| 90+ days | Auto-deleted via TTL index |
+
+The TTL index on `createdAt` automatically removes documents older than 90 days, keeping the collection size manageable without manual intervention.

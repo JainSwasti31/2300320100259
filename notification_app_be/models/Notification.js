@@ -45,4 +45,14 @@ const notificationSchema = new mongoose.Schema(
   }
 );
 
+// Indexes for query performance at scale
+notificationSchema.index({ status: 1 });
+notificationSchema.index({ type: 1 });
+notificationSchema.index({ createdAt: -1 });
+notificationSchema.index({ status: 1, createdAt: -1 });
+notificationSchema.index({ type: 1, createdAt: -1 });
+
+// TTL index: auto-delete notifications older than 90 days
+notificationSchema.index({ createdAt: 1 }, { expireAfterSeconds: 7776000 });
+
 module.exports = mongoose.model("Notification", notificationSchema);
