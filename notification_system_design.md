@@ -1047,3 +1047,251 @@ Full table scan of 5M rows, filter, then sort/distinct. Easily 15-20 seconds.
 | 5 | Create targeted composite indexes based on query patterns | Best performance-to-cost ratio |
 | 6 | Use EXPLAIN regularly | Catch slow queries before they hit production |
 | 7 | Consider partitioning by date for tables > 10M rows | Faster range queries and easier maintenance |
+
+---
+
+# Stage 4
+
+## Performance Optimization — Reducing DB Load on Page Loads
+
+---
+
+## The Problem
+
+Every time a student opens the notification page, the app fires a query to the database. With 50,000 students and frequent page loads (think: students refreshing before placement results), the DB gets hammered with thousands of identical or near-identical queries per minute. The database becomes the bottleneck — response times climb from milliseconds to seconds, and eventually the connection pool gets exhausted.
+
+The root cause is straightforward: we're treating the database as if it's cheap to query, but at scale, every round trip costs CPU, memory, disk I/O, and a connection slot.
+
+---
+
+## Strategy 1: Caching Layer (Redis)
+
+### How it works
+
+Place a Redis cache between the application and MongoDB. When a student requests their notifications:
+
+1. Check Redis first — if the data exists and isn't stale, return it immediately
+2. If cache miss, query MongoDB, store the result in Redis with a TTL, then return
+3. When a new notification is created or marked as read, invalidate the relevant cache entry
+
+### Implementation sketch
+
+```javascript
+const redis = require("redis");
+const client = redis.createClient();
+
+async function getNotifications(page, limit) {
+  const cacheKey = `notifications:page:${page}:limit:${limit}`;
+  
+  // Try cache first
+  const cached = await client.get(cacheKey);
+  if (cached) {
+    Log("backend", "info", "cache", `Cache HIT for ${cacheKey}`);
+    return JSON.parse(cached);
+  }
+
+  // Cache miss — hit the DB
+  Log("backend", "info", "cache", `Cache MISS for ${cacheKey}, querying DB`);
+  const result = await Notification.find({})
+    .sort({ createdAt: -1 })
+    .skip((page - 1) * limit)
+    .limit(limit);
+
+  // Store in cache with 60-second TTL
+  await client.setEx(cacheKey, 60, JSON.stringify(result));
+  return result;
+}
+```
+
+### Cache invalidation
+
+```javascript
+// When a notification is created or modified
+async function invalidateCache() {
+  const keys = await client.keys("notifications:*");
+  if (keys.length > 0) {
+    await client.del(keys);
+  }
+  Log("backend", "info", "cache", `Invalidated ${keys.length} cache entries`);
+}
+```
+
+### Tradeoffs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Massive read performance boost (sub-ms responses from Redis) | Adds infrastructure complexity (another service to maintain) |
+| DB load drops by 80-95% for repeated queries | Stale data risk — students might not see the newest notification for up to TTL seconds |
+| Redis is dirt cheap on memory for this data size | Cache invalidation is tricky to get right (can lead to bugs) |
+| Horizontal scaling is easy — Redis Cluster handles partitioning | Extra cost — need to run and monitor a Redis instance |
+| Works great for data that's read far more than it's written | Cold start problem — first request after invalidation still hits DB |
+
+### When to use this
+
+Best fit when read-to-write ratio is high (our case: notifications are read 100x more than they're written). The 60-second TTL is a good balance — new notifications appear within a minute.
+
+---
+
+## Strategy 2: WebSocket Push (Eliminate Polling Entirely)
+
+### How it works
+
+Instead of students refreshing the page to check for new notifications, the server pushes updates to the client the instant something happens. The frontend maintains a persistent WebSocket connection — no repeated DB queries needed.
+
+Flow:
+1. Student opens the page → one initial DB query loads notifications
+2. WebSocket connection stays open
+3. When a new notification is created → server emits event → client prepends it to the list
+4. No more page reload queries for "what's new"
+
+### What this means for DB load
+
+- **Before**: 50,000 students × 3 page loads per hour = 150,000 queries/hour
+- **After**: 50,000 initial queries + only N queries when new notifications are actually created
+- If 20 notifications are created per hour, that's 20 DB writes vs 150,000 reads eliminated
+
+### Already implemented in our codebase
+
+We already have Socket.IO in `notification_app_be/socket/index.js` and the frontend listens for `new_notification`, `notification_read`, etc. The client state updates in real-time without polling.
+
+### Tradeoffs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Truly real-time — instant delivery, no lag | WebSocket connections consume server memory (~10KB per connection) |
+| Eliminates most read queries entirely | 50,000 concurrent connections need a beefy server or horizontal scaling |
+| Better UX — notifications appear without refresh | If connection drops, client needs reconnection logic + a catch-up mechanism |
+| Less bandwidth than polling (no repeated HTTP overhead) | Harder to debug than simple REST (stateful connection) |
+| | Load balancers need sticky sessions or Redis adapter for Socket.IO |
+
+### Scaling WebSockets
+
+For 50K concurrent connections:
+- Use `@socket.io/redis-adapter` so multiple Node.js processes can share socket state
+- Deploy behind a load balancer with WebSocket support (nginx with `proxy_pass` upgrade)
+- Each Node process can handle ~10K connections, so 5 processes covers the load
+
+---
+
+## Strategy 3: HTTP Response Caching (ETag / Conditional Requests)
+
+### How it works
+
+Add ETag headers to API responses. When the client makes a request, it sends the ETag from the last response. If nothing changed, the server returns `304 Not Modified` without hitting the DB or transferring the payload again.
+
+```javascript
+app.use((req, res, next) => {
+  // Generate ETag based on response content hash
+  res.set("Cache-Control", "private, max-age=30");
+  next();
+});
+```
+
+### Tradeoffs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Zero infrastructure addition — works with standard HTTP | Still makes a round trip to the server (just saves bandwidth, not server-side DB query unless combined with server cache) |
+| Browsers handle it natively | Only useful if data hasn't changed — if notifications update frequently, ETags rarely match |
+| Reduces bandwidth by 90%+ on cache hits | Doesn't reduce DB load unless the server also caches internally |
+| Easy to implement with Express middleware | Limited to GET requests |
+
+### Verdict
+
+Helpful as a supplementary strategy but doesn't solve the core DB load problem on its own. Best combined with Strategy 1.
+
+---
+
+## Strategy 4: Pagination + Lazy Loading
+
+### How it works
+
+Instead of fetching all notifications at once, load only the first 15-20 items. As the student scrolls down, fetch the next page. This is already partially implemented but can be improved with cursor-based pagination.
+
+### Cursor-based pagination (better than offset)
+
+```javascript
+// First page
+db.notifications.find({})
+  .sort({ createdAt: -1 })
+  .limit(20);
+
+// Next page — use last item's createdAt as cursor
+db.notifications.find({ createdAt: { $lt: lastSeenCreatedAt } })
+  .sort({ createdAt: -1 })
+  .limit(20);
+```
+
+### Why cursor-based beats offset/skip
+
+With `skip(1000)`, MongoDB still scans and discards 1000 documents. With a cursor, it seeks directly to the right position using the index. On page 50, offset pagination scans 1000 docs to skip; cursor pagination scans 0.
+
+### Tradeoffs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Each query returns a small, fixed-size result set | Only helps if students actually scroll gradually (if they jump to "page 50", cursor can't do that) |
+| Cursor-based is O(1) regardless of page depth | Slightly more complex client logic (track cursor state) |
+| DB reads fewer documents per query | Doesn't reduce total queries — just makes each one cheaper |
+| Memory-friendly on both server and client | Still hits DB on every page load without caching |
+
+---
+
+## Strategy 5: Database Read Replicas
+
+### How it works
+
+Set up MongoDB replica set with one primary (handles writes) and 2-3 secondaries (handle reads). Point all notification GET queries to read replicas, spreading the load.
+
+```javascript
+mongoose.connect(MONGODB_URI, {
+  readPreference: "secondaryPreferred"
+});
+```
+
+### Tradeoffs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Linear read scaling — add more replicas as users grow | Replication lag — reads might be slightly behind (eventual consistency) |
+| Zero code changes (just a connection config) | Doesn't reduce individual query cost, just distributes load |
+| Built into MongoDB — no extra tools needed | More infrastructure to manage (monitoring, failover) |
+| Write path unaffected | Storage cost multiplied by replica count |
+
+---
+
+## My Recommended Approach (Combination)
+
+No single strategy is a silver bullet. Here's what I'd actually deploy:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Client (React)                         │
+│  1. Initial load → REST API (cached)                     │
+│  2. Real-time updates → WebSocket (no more polling)      │
+│  3. Scroll → Cursor-based pagination                     │
+└───────────────────────┬──────────────────────────────────┘
+                        │
+                        ▼
+┌──────────────────────────────────────────────────────────┐
+│                   Node.js Server                          │
+│  - Redis cache (60s TTL) for GET /notifications          │
+│  - Socket.IO for real-time push                          │
+│  - Cache invalidation on POST/PATCH/DELETE               │
+└───────────┬────────────────────────────┬─────────────────┘
+            │                            │
+            ▼                            ▼
+┌──────────────────┐         ┌─────────────────────┐
+│   Redis Cache    │         │  MongoDB Replica Set │
+│   (hot data)     │         │  Primary + 2 Replicas│
+└──────────────────┘         └─────────────────────┘
+```
+
+### Priority order of implementation:
+
+1. **Redis caching** — biggest bang for buck, eliminates 90%+ of DB reads
+2. **WebSocket push** — already in place, eliminates refresh-based polling
+3. **Cursor-based pagination** — makes remaining queries cheap
+4. **Read replicas** — for when you outgrow a single node
+
+This layered approach means the DB is only queried on cache misses and writes. For our 50K student scenario, the DB goes from handling 150K+ queries/hour to maybe 5K queries/hour — a 97% reduction.
