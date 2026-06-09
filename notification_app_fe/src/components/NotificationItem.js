@@ -9,21 +9,30 @@ import {
   Tooltip,
   Typography,
 } from "@mui/material";
-import InfoIcon from "@mui/icons-material/Info";
-import PaymentIcon from "@mui/icons-material/Payment";
-import ShoppingCartIcon from "@mui/icons-material/ShoppingCart";
-import WarningIcon from "@mui/icons-material/Warning";
-import SettingsIcon from "@mui/icons-material/Settings";
+import WorkIcon from "@mui/icons-material/Work";
+import EventIcon from "@mui/icons-material/Event";
+import AssignmentIcon from "@mui/icons-material/Assignment";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import DeleteIcon from "@mui/icons-material/Delete";
 import { markAsRead, deleteNotification } from "../services/api";
+import Log from "../services/logger";
+
+/**
+ * NotificationItem Component
+ * Renders a single campus notification with type-specific icons.
+ * Types: placement (job icon), event (calendar icon), result (assignment icon)
+ */
 
 const typeIcons = {
-  info: <InfoIcon color="info" />,
-  payment: <PaymentIcon color="success" />,
-  order: <ShoppingCartIcon color="primary" />,
-  alert: <WarningIcon color="warning" />,
-  system: <SettingsIcon color="action" />,
+  placement: <WorkIcon color="primary" />,
+  event: <EventIcon color="secondary" />,
+  result: <AssignmentIcon color="success" />,
+};
+
+const typeLabels = {
+  placement: "Placement",
+  event: "Event",
+  result: "Result",
 };
 
 const priorityColors = {
@@ -38,19 +47,23 @@ const NotificationItem = ({ notification, onRefresh }) => {
 
   const handleMarkRead = async () => {
     try {
+      Log("frontend", "info", "component", `Marking notification as read: id=${id}`);
       await markAsRead(id);
+      Log("frontend", "info", "component", `Notification id=${id} marked as read successfully`);
       onRefresh();
     } catch (err) {
-      console.error("Failed to mark as read:", err);
+      Log("frontend", "error", "component", `Failed to mark notification id=${id} as read: ${err.message}`);
     }
   };
 
   const handleDelete = async () => {
     try {
+      Log("frontend", "info", "component", `Deleting notification: id=${id}`);
       await deleteNotification(id);
+      Log("frontend", "info", "component", `Notification id=${id} deleted successfully`);
       onRefresh();
     } catch (err) {
-      console.error("Failed to delete notification:", err);
+      Log("frontend", "error", "component", `Failed to delete notification id=${id}: ${err.message}`);
     }
   };
 
@@ -67,24 +80,40 @@ const NotificationItem = ({ notification, onRefresh }) => {
         <Box>
           {isUnread && (
             <Tooltip title="Mark as read">
-              <IconButton edge="end" onClick={handleMarkRead} aria-label="Mark as read">
+              <IconButton
+                edge="end"
+                onClick={handleMarkRead}
+                aria-label="Mark as read"
+              >
                 <CheckCircleIcon color="success" />
               </IconButton>
             </Tooltip>
           )}
           <Tooltip title="Delete">
-            <IconButton edge="end" onClick={handleDelete} aria-label="Delete notification">
+            <IconButton
+              edge="end"
+              onClick={handleDelete}
+              aria-label="Delete notification"
+            >
               <DeleteIcon color="error" />
             </IconButton>
           </Tooltip>
         </Box>
       }
     >
-      <ListItemIcon>{typeIcons[notification.type] || <InfoIcon />}</ListItemIcon>
+      <ListItemIcon>
+        {typeIcons[notification.type] || <EventIcon />}
+      </ListItemIcon>
       <ListItemText
         primary={
           <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
             <strong>{notification.title}</strong>
+            <Chip
+              label={typeLabels[notification.type] || notification.type}
+              size="small"
+              color="primary"
+              variant="outlined"
+            />
             <Chip
               label={notification.priority}
               size="small"
@@ -97,7 +126,11 @@ const NotificationItem = ({ notification, onRefresh }) => {
           <>
             {notification.message}
             <br />
-            <Typography variant="caption" color="text.secondary" component="span">
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              component="span"
+            >
               {new Date(notification.createdAt).toLocaleString()}
             </Typography>
           </>

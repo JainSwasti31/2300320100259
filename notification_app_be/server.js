@@ -1,9 +1,11 @@
+// Load environment variables before any module that depends on them
+require("dotenv").config();
+
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
-require("dotenv").config();
 
 const Log = require("../logging_middleware");
 const notificationRoutes = require("./routes/notification.routes");
@@ -12,7 +14,7 @@ const { setupSocket } = require("./socket");
 const app = express();
 const server = http.createServer(app);
 
-// Socket.IO setup
+// Socket.IO configuration with CORS
 const io = new Server(server, {
   cors: {
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -20,40 +22,40 @@ const io = new Server(server, {
   },
 });
 
-// Make io accessible in routes
+// Make Socket.IO instance accessible in route handlers
 app.set("io", io);
 
-// Middleware
+// Global middleware
 app.use(cors());
 app.use(express.json());
 
-// HTTP request logging middleware
+// HTTP request/response logging via logging middleware
 app.use((req, res, next) => {
   const start = Date.now();
   res.on("finish", () => {
     const duration = Date.now() - start;
     Log(
-      "HTTPMiddleware",
+      "backend",
       res.statusCode >= 400 ? "error" : "info",
-      "notification_app_be",
-      `${req.method} ${req.originalUrl} - ${res.statusCode} (${duration}ms) from ${req.ip}`
+      "middleware",
+      `${req.method} ${req.originalUrl} - ${res.statusCode} (${duration}ms)`
     );
   });
   next();
 });
 
-// Routes
+// API Routes
 app.use("/api/v1/notifications", notificationRoutes);
 
-// Health check
+// Health check endpoint
 app.get("/api/health", (req, res) => {
-  res.json({ success: true, message: "Server is running" });
+  res.json({ success: true, message: "Campus Notification Server is running" });
 });
 
-// Socket.IO authentication and setup
+// Initialize Socket.IO
 setupSocket(io);
 
-// MongoDB connection and server start
+// Database connection and server startup
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI =
   process.env.MONGODB_URI || "mongodb://localhost:27017/notification_app";
@@ -61,27 +63,22 @@ const MONGODB_URI =
 mongoose
   .connect(MONGODB_URI)
   .then(() => {
-    Log(
-      "Server.startup",
-      "info",
-      "notification_app_be",
-      `Successfully connected to MongoDB at ${MONGODB_URI}`
-    );
+    Log("backend", "info", "db", "Successfully connected to MongoDB");
     server.listen(PORT, () => {
       Log(
-        "Server.startup",
+        "backend",
         "info",
-        "notification_app_be",
-        `Server running on port ${PORT}, accepting connections`
+        "domain",
+        `Campus Notification Server running on port ${PORT}`
       );
     });
   })
   .catch((err) => {
     Log(
-      "Server.startup",
-      "error",
-      "notification_app_be",
-      `MongoDB connection failed: ${err.message}. Shutting down.`
+      "backend",
+      "fatal",
+      "db",
+      `MongoDB connection failed: ${err.message}. Server shutting down.`
     );
     process.exit(1);
   });

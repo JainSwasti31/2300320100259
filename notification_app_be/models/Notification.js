@@ -1,26 +1,25 @@
 const mongoose = require("mongoose");
 
+/**
+ * Notification Schema
+ * Represents a campus notification for students about Placements, Events, or Results.
+ */
 const notificationSchema = new mongoose.Schema(
   {
-    userId: {
-      type: String,
-      required: true,
-      index: true,
-    },
     title: {
       type: String,
       required: true,
-      maxlength: 150,
+      maxlength: 200,
     },
     message: {
       type: String,
       required: true,
-      maxlength: 500,
+      maxlength: 1000,
     },
     type: {
       type: String,
       required: true,
-      enum: ["order", "payment", "alert", "info", "system"],
+      enum: ["placement", "event", "result"],
     },
     status: {
       type: String,

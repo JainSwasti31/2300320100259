@@ -1,6 +1,5 @@
 const express = require("express");
 const router = express.Router();
-const authMiddleware = require("../middleware/auth");
 const {
   getNotifications,
   getNotificationById,
@@ -11,10 +10,9 @@ const {
   getUnreadCount,
 } = require("../controllers/notification.controller");
 
-// All routes require authentication
-router.use(authMiddleware);
+// No authentication required - users are pre-authorized
 
-// GET /api/v1/notifications/unread-count (placed before /:id to avoid conflict)
+// GET /api/v1/notifications/unread-count (placed before /:id to avoid route conflict)
 router.get("/unread-count", getUnreadCount);
 
 // GET /api/v1/notifications
@@ -26,7 +24,7 @@ router.get("/:id", getNotificationById);
 // POST /api/v1/notifications
 router.post("/", createNotification);
 
-// PATCH /api/v1/notifications/read-all
+// PATCH /api/v1/notifications/read-all (placed before /:id/read to avoid conflict)
 router.patch("/read-all", markAllAsRead);
 
 // PATCH /api/v1/notifications/:id/read

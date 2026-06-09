@@ -1,63 +1,36 @@
-const jwt = require("jsonwebtoken");
 const Log = require("../../logging_middleware");
 
-const PKG = "notification_app_be";
-
-
+/**
+ * Socket.IO Setup
+ * Handles real-time WebSocket connections for campus notifications.
+ * No authentication required - users are pre-authorized.
+ */
 const setupSocket = (io) => {
-  // Authentication middleware for Socket.IO
-  io.use((socket, next) => {
-    const token = socket.handshake.auth.token;
-    if (!token) {
-      Log(
-        "Socket.authMiddleware",
-        "warn",
-        PKG,
-        `Socket connection rejected - no auth token provided from ${socket.handshake.address}`
-      );
-      return next(new Error("Authentication token is required"));
-    }
-
-    try {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      socket.userId = decoded.userId;
-      Log(
-        "Socket.authMiddleware",
-        "debug",
-        PKG,
-        `Socket authenticated for user=${decoded.userId}`
-      );
-      next();
-    } catch (err) {
-      Log(
-        "Socket.authMiddleware",
-        "warn",
-        PKG,
-        `Socket authentication failed: ${err.message}`
-      );
-      next(new Error("Authentication failed"));
-    }
-  });
-
-  // Connection handler
   io.on("connection", (socket) => {
     Log(
-      "Socket.connection",
+      "backend",
       "info",
-      PKG,
-      `User connected via WebSocket: userId=${socket.userId}, socketId=${socket.id}`
+      "domain",
+      `WebSocket connected: socketId=${socket.id}, transport=${socket.conn.transport.name}`
     );
-
-    // Join user to their private room
-    socket.join(`user_${socket.userId}`);
 
     // Handle disconnection
     socket.on("disconnect", (reason) => {
       Log(
-        "Socket.disconnect",
+        "backend",
         "info",
-        PKG,
-        `User disconnected: userId=${socket.userId}, socketId=${socket.id}, reason=${reason}`
+        "domain",
+        `WebSocket disconnected: socketId=${socket.id}, reason=${reason}`
+      );
+    });
+
+    // Handle connection errors
+    socket.on("error", (err) => {
+      Log(
+        "backend",
+        "error",
+        "domain",
+        `WebSocket error: socketId=${socket.id}, error=${err.message}`
       );
     });
   });

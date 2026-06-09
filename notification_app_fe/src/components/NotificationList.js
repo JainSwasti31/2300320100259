@@ -10,7 +10,12 @@ import {
 import DoneAllIcon from "@mui/icons-material/DoneAll";
 import NotificationItem from "./NotificationItem";
 import { markAllAsRead } from "../services/api";
+import Log from "../services/logger";
 
+/**
+ * NotificationList Component
+ * Displays a paginated list of campus notifications with a "Mark All Read" action.
+ */
 const NotificationList = ({
   notifications,
   page,
@@ -20,10 +25,12 @@ const NotificationList = ({
 }) => {
   const handleMarkAllRead = async () => {
     try {
+      Log("frontend", "info", "component", "User clicked Mark All Read");
       await markAllAsRead();
+      Log("frontend", "info", "component", "All notifications marked as read successfully");
       onRefresh();
     } catch (err) {
-      console.error("Failed to mark all as read:", err);
+      Log("frontend", "error", "component", `Failed to mark all as read: ${err.message}`);
     }
   };
 
@@ -38,7 +45,7 @@ const NotificationList = ({
         }}
       >
         <Typography variant="h5" component="h1">
-          Notifications
+          Campus Notifications
         </Typography>
         <Button
           variant="outlined"
@@ -51,8 +58,12 @@ const NotificationList = ({
       </Box>
 
       {notifications.length === 0 ? (
-        <Typography variant="body1" color="text.secondary" sx={{ py: 4, textAlign: "center" }}>
-          No notifications yet.
+        <Typography
+          variant="body1"
+          color="text.secondary"
+          sx={{ py: 4, textAlign: "center" }}
+        >
+          No notifications yet. Check back for Placements, Events, and Results updates.
         </Typography>
       ) : (
         <>

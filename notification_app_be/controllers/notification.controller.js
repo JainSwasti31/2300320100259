@@ -1,26 +1,27 @@
 const Notification = require("../models/Notification");
 const Log = require("../../logging_middleware");
 
-const PKG = "notification_app_be";
-
 /**
- * Get all notifications for the logged-in user
+ * GET /api/v1/notifications
+ * Retrieves all notifications with pagination and optional status filter.
  */
 exports.getNotifications = async (req, res) => {
   try {
-    const { page = 1, limit = 20, status = "all" } = req.query;
-    const userId = req.user.userId;
+    const { page = 1, limit = 20, status = "all", type } = req.query;
 
     Log(
-      "NotificationController.getNotifications",
+      "backend",
       "info",
-      PKG,
-      `Fetching notifications for user=${userId}, page=${page}, limit=${limit}, status=${status}`
+      "controller",
+      `Fetching notifications: page=${page}, limit=${limit}, status=${status}, type=${type || "all"}`
     );
 
-    const filter = { userId };
+    const filter = {};
     if (status !== "all") {
       filter.status = status;
+    }
+    if (type) {
+      filter.type = type;
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -31,10 +32,10 @@ exports.getNotifications = async (req, res) => {
       .limit(parseInt(limit));
 
     Log(
-      "NotificationController.getNotifications",
+      "backend",
       "info",
-      PKG,
-      `Returned ${notifications.length} notifications out of ${totalItems} total for user=${userId}`
+      "controller",
+      `Returned ${notifications.length} of ${totalItems} total notifications`
     );
 
     res.status(200).json({
@@ -51,10 +52,10 @@ exports.getNotifications = async (req, res) => {
     });
   } catch (err) {
     Log(
-      "NotificationController.getNotifications",
+      "backend",
       "error",
-      PKG,
-      `Failed to fetch notifications for user=${req.user.userId}: ${err.message}`
+      "controller",
+      `Failed to fetch notifications: ${err.message}`
     );
     res.status(500).json({
       success: false,
@@ -67,30 +68,18 @@ exports.getNotifications = async (req, res) => {
 };
 
 /**
- * Get a single notification by ID
+ * GET /api/v1/notifications/:id
+ * Retrieves a single notification by its ID.
  */
 exports.getNotificationById = async (req, res) => {
   try {
     const { id } = req.params;
-    Log(
-      "NotificationController.getNotificationById",
-      "info",
-      PKG,
-      `Fetching notification id=${id} for user=${req.user.userId}`
-    );
+    Log("backend", "info", "controller", `Fetching notification id=${id}`);
 
-    const notification = await Notification.findOne({
-      _id: id,
-      userId: req.user.userId,
-    });
+    const notification = await Notification.findById(id);
 
     if (!notification) {
-      Log(
-        "NotificationController.getNotificationById",
-        "warn",
-        PKG,
-        `Notification id=${id} not found for user=${req.user.userId}`
-      );
+      Log("backend", "warn", "controller", `Notification id=${id} not found`);
       return res.status(404).json({
         success: false,
         error: {
@@ -103,9 +92,9 @@ exports.getNotificationById = async (req, res) => {
     res.status(200).json({ success: true, data: notification });
   } catch (err) {
     Log(
-      "NotificationController.getNotificationById",
+      "backend",
       "error",
-      PKG,
+      "controller",
       `Error fetching notification id=${req.params.id}: ${err.message}`
     );
     res.status(500).json({
@@ -119,32 +108,38 @@ exports.getNotificationById = async (req, res) => {
 };
 
 /**
- * Create a new notification
+ * POST /api/v1/notifications
+ * Creates a new campus notification (Placement, Event, or Result).
  */
 exports.createNotification = async (req, res) => {
   try {
-    const { userId, title, message, type, priority, metadata } = req.body;
+    const { title, message, type, priority, metadata } = req.body;
 
     Log(
-      "NotificationController.createNotification",
+      "backend",
       "info",
-      PKG,
-      `Creating notification: type=${type}, priority=${priority || "low"}, targetUser=${userId}, title="${title}"`
+      "controller",
+      `Creating notification: type=${type}, priority=${priority || "low"}, title="${title}"`
     );
 
-    // Validation
+    // Manual validation without external libraries
     const errors = [];
-    if (!userId) errors.push({ field: "userId", message: "User ID is required." });
     if (!title) errors.push({ field: "title", message: "Title is required." });
     if (!message) errors.push({ field: "message", message: "Message is required." });
     if (!type) errors.push({ field: "type", message: "Type is required." });
+    if (type && !["placement", "event", "result"].includes(type)) {
+      errors.push({ field: "type", message: "Type must be placement, event, or result." });
+    }
+    if (priority && !["low", "medium", "high"].includes(priority)) {
+      errors.push({ field: "priority", message: "Priority must be low, medium, or high." });
+    }
 
     if (errors.length > 0) {
       Log(
-        "NotificationController.createNotification",
+        "backend",
         "warn",
-        PKG,
-        `Validation failed: ${errors.map((e) => e.field).join(", ")} missing`
+        "handler",
+        `Validation failed for createNotification: ${errors.map((e) => e.field).join(", ")}`
       );
       return res.status(400).json({
         success: false,
@@ -157,7 +152,6 @@ exports.createNotification = async (req, res) => {
     }
 
     const notification = await Notification.create({
-      userId,
       title,
       message,
       type,
@@ -166,15 +160,15 @@ exports.createNotification = async (req, res) => {
     });
 
     Log(
-      "NotificationController.createNotification",
+      "backend",
       "info",
-      PKG,
-      `Notification created successfully: id=${notification._id}, emitting real-time event to user=${userId}`
+      "controller",
+      `Notification created: id=${notification._id}, type=${type}, emitting real-time event`
     );
 
-    // Emit real-time notification via Socket.IO
+    // Emit real-time notification via Socket.IO to all connected clients
     const io = req.app.get("io");
-    io.to(`user_${userId}`).emit("new_notification", {
+    io.emit("new_notification", {
       id: notification._id,
       title: notification.title,
       message: notification.message,
@@ -186,9 +180,9 @@ exports.createNotification = async (req, res) => {
     res.status(201).json({ success: true, data: notification });
   } catch (err) {
     Log(
-      "NotificationController.createNotification",
+      "backend",
       "error",
-      PKG,
+      "controller",
       `Failed to create notification: ${err.message}`
     );
     res.status(500).json({
@@ -202,31 +196,22 @@ exports.createNotification = async (req, res) => {
 };
 
 /**
- * Mark a notification as read
+ * PATCH /api/v1/notifications/:id/read
+ * Marks a specific notification as read.
  */
 exports.markAsRead = async (req, res) => {
   try {
     const { id } = req.params;
-    Log(
-      "NotificationController.markAsRead",
-      "info",
-      PKG,
-      `Marking notification id=${id} as read for user=${req.user.userId}`
-    );
+    Log("backend", "info", "controller", `Marking notification id=${id} as read`);
 
-    const notification = await Notification.findOneAndUpdate(
-      { _id: id, userId: req.user.userId },
+    const notification = await Notification.findByIdAndUpdate(
+      id,
       { status: "read", readAt: new Date() },
       { new: true }
     );
 
     if (!notification) {
-      Log(
-        "NotificationController.markAsRead",
-        "warn",
-        PKG,
-        `Notification id=${id} not found or not owned by user=${req.user.userId}`
-      );
+      Log("backend", "warn", "controller", `Notification id=${id} not found for markAsRead`);
       return res.status(404).json({
         success: false,
         error: {
@@ -238,17 +223,12 @@ exports.markAsRead = async (req, res) => {
 
     // Emit real-time event
     const io = req.app.get("io");
-    io.to(`user_${req.user.userId}`).emit("notification_read", {
+    io.emit("notification_read", {
       id: notification._id,
       readAt: notification.readAt,
     });
 
-    Log(
-      "NotificationController.markAsRead",
-      "info",
-      PKG,
-      `Notification id=${id} marked as read at ${notification.readAt}`
-    );
+    Log("backend", "info", "handler", `Notification id=${id} marked as read at ${notification.readAt}`);
 
     res.status(200).json({
       success: true,
@@ -260,9 +240,9 @@ exports.markAsRead = async (req, res) => {
     });
   } catch (err) {
     Log(
-      "NotificationController.markAsRead",
+      "backend",
       "error",
-      PKG,
+      "controller",
       `Failed to mark notification id=${req.params.id} as read: ${err.message}`
     );
     res.status(500).json({
@@ -276,33 +256,29 @@ exports.markAsRead = async (req, res) => {
 };
 
 /**
- * Mark all notifications as read
+ * PATCH /api/v1/notifications/read-all
+ * Marks all unread notifications as read.
  */
 exports.markAllAsRead = async (req, res) => {
   try {
-    Log(
-      "NotificationController.markAllAsRead",
-      "info",
-      PKG,
-      `Marking all unread notifications as read for user=${req.user.userId}`
-    );
+    Log("backend", "info", "controller", "Marking all unread notifications as read");
 
     const result = await Notification.updateMany(
-      { userId: req.user.userId, status: "unread" },
+      { status: "unread" },
       { status: "read", readAt: new Date() }
     );
 
     // Emit real-time event
     const io = req.app.get("io");
-    io.to(`user_${req.user.userId}`).emit("all_notifications_read", {
+    io.emit("all_notifications_read", {
       updatedCount: result.modifiedCount,
     });
 
     Log(
-      "NotificationController.markAllAsRead",
+      "backend",
       "info",
-      PKG,
-      `Marked ${result.modifiedCount} notifications as read for user=${req.user.userId}`
+      "handler",
+      `Marked ${result.modifiedCount} notifications as read`
     );
 
     res.status(200).json({
@@ -314,10 +290,10 @@ exports.markAllAsRead = async (req, res) => {
     });
   } catch (err) {
     Log(
-      "NotificationController.markAllAsRead",
+      "backend",
       "error",
-      PKG,
-      `Failed to mark all as read for user=${req.user.userId}: ${err.message}`
+      "controller",
+      `Failed to mark all as read: ${err.message}`
     );
     res.status(500).json({
       success: false,
@@ -330,30 +306,18 @@ exports.markAllAsRead = async (req, res) => {
 };
 
 /**
- * Delete a notification
+ * DELETE /api/v1/notifications/:id
+ * Deletes a specific notification.
  */
 exports.deleteNotification = async (req, res) => {
   try {
     const { id } = req.params;
-    Log(
-      "NotificationController.deleteNotification",
-      "info",
-      PKG,
-      `Deleting notification id=${id} for user=${req.user.userId}`
-    );
+    Log("backend", "info", "controller", `Deleting notification id=${id}`);
 
-    const notification = await Notification.findOneAndDelete({
-      _id: id,
-      userId: req.user.userId,
-    });
+    const notification = await Notification.findByIdAndDelete(id);
 
     if (!notification) {
-      Log(
-        "NotificationController.deleteNotification",
-        "warn",
-        PKG,
-        `Notification id=${id} not found or not owned by user=${req.user.userId}`
-      );
+      Log("backend", "warn", "controller", `Notification id=${id} not found for deletion`);
       return res.status(404).json({
         success: false,
         error: {
@@ -365,16 +329,9 @@ exports.deleteNotification = async (req, res) => {
 
     // Emit real-time event
     const io = req.app.get("io");
-    io.to(`user_${req.user.userId}`).emit("notification_deleted", {
-      id: notification._id,
-    });
+    io.emit("notification_deleted", { id: notification._id });
 
-    Log(
-      "NotificationController.deleteNotification",
-      "info",
-      PKG,
-      `Notification id=${id} deleted successfully`
-    );
+    Log("backend", "info", "controller", `Notification id=${id} deleted successfully`);
 
     res.status(200).json({
       success: true,
@@ -385,9 +342,9 @@ exports.deleteNotification = async (req, res) => {
     });
   } catch (err) {
     Log(
-      "NotificationController.deleteNotification",
+      "backend",
       "error",
-      PKG,
+      "controller",
       `Failed to delete notification id=${req.params.id}: ${err.message}`
     );
     res.status(500).json({
@@ -401,28 +358,16 @@ exports.deleteNotification = async (req, res) => {
 };
 
 /**
- * Get unread notification count
+ * GET /api/v1/notifications/unread-count
+ * Returns the count of all unread notifications.
  */
 exports.getUnreadCount = async (req, res) => {
   try {
-    Log(
-      "NotificationController.getUnreadCount",
-      "info",
-      PKG,
-      `Fetching unread count for user=${req.user.userId}`
-    );
+    Log("backend", "info", "controller", "Fetching unread notification count");
 
-    const unreadCount = await Notification.countDocuments({
-      userId: req.user.userId,
-      status: "unread",
-    });
+    const unreadCount = await Notification.countDocuments({ status: "unread" });
 
-    Log(
-      "NotificationController.getUnreadCount",
-      "debug",
-      PKG,
-      `User=${req.user.userId} has ${unreadCount} unread notifications`
-    );
+    Log("backend", "debug", "controller", `Unread count: ${unreadCount}`);
 
     res.status(200).json({
       success: true,
@@ -430,10 +375,10 @@ exports.getUnreadCount = async (req, res) => {
     });
   } catch (err) {
     Log(
-      "NotificationController.getUnreadCount",
+      "backend",
       "error",
-      PKG,
-      `Failed to get unread count for user=${req.user.userId}: ${err.message}`
+      "controller",
+      `Failed to get unread count: ${err.message}`
     );
     res.status(500).json({
       success: false,
